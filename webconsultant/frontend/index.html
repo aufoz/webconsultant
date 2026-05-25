@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebConsultant — AI-консультант для сайтов</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Onest:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- ══════════════════════ SIDEBAR ══════════════════════ -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-logo">
+    <span class="logo-icon">◈</span>
+    <span class="logo-text">WebConsultant</span>
+  </div>
+
+  <nav class="sidebar-nav">
+    <button class="nav-item active" data-view="scan" onclick="switchView('scan')">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+      Сканировать
+    </button>
+    <button class="nav-item" data-view="chat" onclick="switchView('chat')">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      Чат
+    </button>
+    <button class="nav-item" data-view="sites" onclick="switchView('sites', true)">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+      База сайтов
+    </button>
+  </nav>
+
+  <div class="sidebar-current" id="sidebarCurrent" style="display:none">
+    <div class="current-label">Активный сайт</div>
+    <div class="current-name" id="currentSiteName">—</div>
+    <div class="current-url" id="currentSiteUrl">—</div>
+    <div class="current-meta" id="currentSiteMeta"></div>
+  </div>
+
+  <div class="sidebar-footer">
+    <div class="status-dot" id="aiStatus"></div>
+    <span id="aiStatusText">Проверка AI...</span>
+  </div>
+</aside>
+
+<!-- ══════════════════════ MAIN ══════════════════════ -->
+<main class="main-content">
+
+  <!-- ── VIEW: SCAN ── -->
+  <div class="view active" id="view-scan">
+    <div class="view-header">
+      <h1>Сканировать сайт</h1>
+      <p class="view-desc">Введите URL — система обойдёт страницы и создаст базу знаний</p>
+    </div>
+
+    <div class="scan-box">
+      <div class="url-row">
+        <div class="url-prefix">https://</div>
+        <input type="text" id="urlInput" class="url-input" placeholder="example.com" autocomplete="off" />
+        <button class="btn-primary" id="btnScan" onclick="startScan()">
+          Сканировать →
+        </button>
+      </div>
+      <div class="url-examples">
+        <span class="ex-label">Попробовать:</span>
+        <button class="ex-pill" onclick="setUrl('wikipedia.org')">wikipedia.org</button>
+        <button class="ex-pill" onclick="setUrl('python.org')">python.org</button>
+        <button class="ex-pill" onclick="setUrl('fastapi.tiangolo.com')">fastapi.tiangolo.com</button>
+      </div>
+    </div>
+
+    <!-- Scanning progress -->
+    <div class="scan-progress" id="scanProgress" style="display:none">
+      <div class="progress-header">
+        <div class="progress-dot"></div>
+        <span id="progressUrl"></span>
+      </div>
+      <div class="progress-steps" id="progressSteps">
+        <div class="ps-item active" id="ps0">
+          <div class="ps-spinner"></div>
+          <span>Загрузка главной страницы...</span>
+        </div>
+        <div class="ps-item" id="ps1">
+          <div class="ps-check">✓</div>
+          <span>Обход внутренних страниц (до 15)...</span>
+        </div>
+        <div class="ps-item" id="ps2">
+          <div class="ps-check">✓</div>
+          <span>Извлечение контента и разделов...</span>
+        </div>
+        <div class="ps-item" id="ps3">
+          <div class="ps-check">✓</div>
+          <span>Сохранение в базу знаний...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Scan result -->
+    <div class="scan-result" id="scanResult" style="display:none">
+      <div class="result-header">
+        <div class="result-icon">✓</div>
+        <div>
+          <div class="result-title" id="resultTitle"></div>
+          <div class="result-url" id="resultUrl"></div>
+        </div>
+      </div>
+      <div class="result-stats" id="resultStats"></div>
+      <div class="result-sections" id="resultSections"></div>
+      <button class="btn-primary" onclick="goToChat()">Открыть чат с консультантом →</button>
+    </div>
+  </div>
+
+  <!-- ── VIEW: CHAT ── -->
+  <div class="view" id="view-chat">
+    <div class="chat-wrapper" id="chatWrapper">
+      <!-- No site selected state -->
+      <div class="chat-empty" id="chatEmpty">
+        <div class="empty-icon">◈</div>
+        <h2>Сайт не выбран</h2>
+        <p>Сначала просканируйте сайт или выберите из базы</p>
+        <button class="btn-primary" onclick="switchView('scan')">Сканировать сайт →</button>
+      </div>
+
+      <!-- Active chat -->
+      <div class="chat-active" id="chatActive" style="display:none">
+        <div class="chat-topbar">
+          <div class="chat-topbar-info">
+            <div class="chat-site-icon">◈</div>
+            <div>
+              <div class="chat-site-name" id="chatSiteName"></div>
+              <div class="chat-site-url" id="chatSiteUrl"></div>
+            </div>
+          </div>
+          <button class="btn-ghost" onclick="clearChat()">Очистить чат</button>
+        </div>
+
+        <div class="chat-messages" id="chatMessages">
+          <div class="chat-welcome" id="chatWelcome"></div>
+        </div>
+
+        <div class="suggested-qs" id="suggestedQs"></div>
+
+        <div class="chat-input-area">
+          <textarea class="chat-textarea" id="chatInput" placeholder="Задайте вопрос о сайте..." rows="1"
+            onkeydown="handleChatKey(event)" oninput="autoResize(this)"></textarea>
+          <button class="btn-send" id="btnSend" onclick="sendChat()">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── VIEW: SITES ── -->
+  <div class="view" id="view-sites">
+    <div class="view-header">
+      <h1>База сайтов</h1>
+      <p class="view-desc">Все просканированные сайты и их статистика</p>
+    </div>
+    <div class="sites-grid" id="sitesGrid">
+      <div class="loading-text">Загрузка...</div>
+    </div>
+  </div>
+
+</main>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
