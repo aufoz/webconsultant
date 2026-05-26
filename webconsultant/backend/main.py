@@ -1,12 +1,7 @@
-import os
-import sqlite3
-import hashlib
-import re
-import math
+import os, sqlite3, hashlib, re, math
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 from collections import Counter
- 
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
@@ -20,9 +15,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
  
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "frontend/static")), name="static")
-DB_PATH = os.path.join(BASE_DIR, "data.db")
+DB_PATH = "/tmp/webconsultant.db"  # /tmp всегда чистый при рестарте
  
-# ── DB ────────────────────────────────────────────────────────────────────────
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -35,8 +29,7 @@ def init_db():
             scanned_at TEXT, page_count INTEGER DEFAULT 0)""")
         db.execute("""CREATE TABLE IF NOT EXISTS pages (
             id INTEGER PRIMARY KEY AUTOINCREMENT, site_id TEXT NOT NULL,
-            url TEXT NOT NULL, title TEXT, content TEXT, section TEXT,
-            FOREIGN KEY(site_id) REFERENCES sites(id))""")
+            url TEXT NOT NULL, title TEXT, content TEXT, section TEXT)""")
         db.execute("""CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT, site_id TEXT NOT NULL,
             session_id TEXT, role TEXT, content TEXT, created_at TEXT)""")
@@ -44,181 +37,132 @@ def init_db():
  
 init_db()
  
-# ── HELPERS ───────────────────────────────────────────────────────────────────
 def make_site_id(url): return hashlib.md5(url.encode()).hexdigest()[:12]
-def clean_text(text):
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+def clean(t): return re.sub(r'\s+', ' ', t).strip()
 def get_domain(url): return urlparse(url).netloc
+def tokenize(t): return re.findall(r'[a-zA-Zа-яА-ЯёЁ]{2,}', t.lower())
  
-# ── SCRAPER ───────────────────────────────────────────────────────────────────
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; WebConsultantBot/1.0)"}
-MAX_PAGES = 15
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
  
-def scrape_page(url):
+def scrape(url):
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script","style","nav","footer","header","aside","form","iframe"]):
-            tag.decompose()
-        title = soup.title.string.strip() if soup.title else url
-        meta_desc = ""
-        meta = soup.find("meta", attrs={"name": "description"})
-        if meta: meta_desc = meta.get("content", "")
-        main = soup.find("main") or soup.find("article") or soup.body
-        text = clean_text(main.get_text(separator=" ") if main else "")
-        if meta_desc: text = meta_desc + " " + text
-        text = text[:4000]
-        base_domain = get_domain(url)
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for t in soup(["script","style","nav","footer","header","aside","form","iframe","noscript"]): t.decompose()
+        title = clean(soup.title.string) if soup.title and soup.title.string else url
+        meta = soup.find("meta", attrs={"name":"description"})
+        desc = meta.get("content","") if meta else ""
+        body = soup.find("main") or soup.find("article") or soup.find(id=re.compile(r"content|main",re.I)) or soup.body
+        text = clean(body.get_text(" ") if body else "")
+        if desc: text = desc + " " + text
+        text = text[:5000]
+        domain = get_domain(url)
         links = set()
         for a in soup.find_all("a", href=True):
-            href = urljoin(url, a["href"])
-            if get_domain(href) == base_domain and href.startswith("http"):
-                p = urlparse(href)
-                if not any(p.path.endswith(e) for e in [".pdf",".jpg",".png",".zip",".xml"]):
-                    links.add(href.split("#")[0])
+            h = urljoin(url, a["href"]).split("#")[0]
+            if get_domain(h) == domain and h.startswith("http"):
+                if not any(h.endswith(e) for e in [".pdf",".jpg",".png",".zip",".xml",".svg"]):
+                    links.add(h)
         path = urlparse(url).path.strip("/")
         section = path.split("/")[0].capitalize() if path else "Home"
-        return {"url": url, "title": clean_text(title), "content": text, "section": section, "links": list(links)[:30]}
+        return {"url":url,"title":title,"content":text,"section":section,"links":list(links)[:25]}
     except Exception as e:
-        return {"url": url, "title": url, "content": "", "section": "", "links": [], "error": str(e)}
+        return {"url":url,"title":url,"content":"","section":"","links":[]}
  
-def crawl_site(start_url):
+def crawl(start_url, max_pages=12):
     visited, queue, pages = set(), [start_url], []
-    base_domain = get_domain(start_url)
-    while queue and len(pages) < MAX_PAGES:
+    domain = get_domain(start_url)
+    while queue and len(pages) < max_pages:
         url = queue.pop(0)
         if url in visited: continue
         visited.add(url)
-        page = scrape_page(url)
-        if page.get("content"): pages.append(page)
-        for link in page.get("links", []):
-            if link not in visited and get_domain(link) == base_domain:
-                queue.append(link)
+        p = scrape(url)
+        if p["content"]: pages.append(p)
+        for l in p["links"]:
+            if l not in visited and get_domain(l) == domain: queue.append(l)
     return pages
  
-# ── TF-IDF SEARCH ─────────────────────────────────────────────────────────────
-def tokenize(text):
-    return re.findall(r'[a-zA-Zа-яА-ЯёЁ]{2,}', text.lower())
- 
-def tfidf_search(site_id, query, top_k=5):
+def search(site_id, query, k=5):
     with get_db() as db:
-        rows = db.execute("SELECT title, content, url, section FROM pages WHERE site_id=?", (site_id,)).fetchall()
-    if not rows: return []
-    
+        rows = db.execute("SELECT title,content,url,section FROM pages WHERE site_id=?", (site_id,)).fetchall()
     docs = [dict(r) for r in rows]
-    q_tokens = tokenize(query)
-    
-    # TF-IDF scoring
+    if not docs: return []
+    q_tok = tokenize(query)
     N = len(docs)
     scored = []
     for doc in docs:
-        text = doc["title"] + " " + doc["content"]
-        tokens = tokenize(text)
+        tokens = tokenize(doc["title"]+" "+doc["content"])
         if not tokens: continue
         tf = Counter(tokens)
         score = 0
-        for t in q_tokens:
+        for t in q_tok:
             if t in tf:
-                # TF
-                tf_score = tf[t] / len(tokens)
-                # IDF
-                df = sum(1 for d in docs if t in tokenize(d["title"] + " " + d["content"]))
-                idf = math.log((N + 1) / (df + 1)) + 1
-                score += tf_score * idf
-        if score > 0:
-            scored.append((score, doc))
-    
+                tf_v = tf[t]/len(tokens)
+                df = sum(1 for d in docs if t in (d["title"]+" "+d["content"]).lower())
+                idf = math.log((N+1)/(df+1))+1
+                score += tf_v * idf
+        if score > 0: scored.append((score, doc))
     scored.sort(key=lambda x: -x[0])
-    return [d for _, d in scored[:top_k]]
+    return [d for _,d in scored[:k]]
  
-# ── SMART ANSWER ENGINE ───────────────────────────────────────────────────────
-def extract_sentences(text):
-    sents = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sents if len(s.strip()) > 20]
+def answer(question, chunks, history):
+    q = question.lower()
  
-def score_sentence(sent, q_tokens):
-    s_tokens = set(tokenize(sent))
-    return sum(1 for t in q_tokens if t in s_tokens)
+    # Greeting
+    if any(w in q for w in ["привет","здравствуй","hello","hi","добрый день","добрый вечер","доброе утро"]):
+        return "Привет! Я консультант этого сайта. Задайте любой вопрос — я постараюсь помочь! 😊"
  
-def generate_answer(question, chunks, history):
     if not chunks:
-        return "К сожалению, по вашему вопросу ничего не найдено на этом сайте. Попробуйте переформулировать вопрос."
-    
-    q_tokens = tokenize(question)
-    
-    # Detect question type
-    q_lower = question.lower()
-    is_what = any(w in q_lower for w in ["что","чем","what","which","какой","какая","какие","о чём","о чем"])
-    is_how = any(w in q_lower for w in ["как","how","каким образом","способ"])
-    is_where = any(w in q_lower for w in ["где","where","куда","откуда"])
-    is_who = any(w in q_lower for w in ["кто","who","чья","чьё"])
-    is_price = any(w in q_lower for w in ["цена","цены","стоимость","сколько стоит","price","cost","тариф"])
-    is_contact = any(w in q_lower for w in ["контакт","связаться","телефон","email","почта","contact","адрес"])
-    is_greeting = any(w in q_lower for w in ["привет","здравствуй","hello","hi","добрый"])
+        return "По вашему вопросу ничего не найдено на этом сайте. Попробуйте переформулировать или задать другой вопрос."
  
-    if is_greeting:
-        site_name = chunks[0].get("section","") if chunks else ""
-        return f"Привет! Я AI-консультант этого сайта. Готов ответить на ваши вопросы. Чем могу помочь?"
+    q_tok = set(tokenize(question))
  
-    # Collect best sentences from all chunks
-    all_sentences = []
+    # Collect all sentences scored by relevance
+    all_sents = []
     for chunk in chunks:
-        text = chunk["title"] + ". " + chunk["content"]
-        sents = extract_sentences(text)
+        raw = chunk["title"] + ". " + chunk["content"]
+        # Split into sentences
+        sents = re.split(r'(?<=[.!?])\s+', raw)
         for s in sents:
-            sc = score_sentence(s, q_tokens)
-            if sc > 0:
-                all_sentences.append((sc, s, chunk))
-    
-    all_sentences.sort(key=lambda x: -x[0])
-    best = all_sentences[:6]
-    
-    if not best:
-        # Return general info about the site
-        first = chunks[0]
-        sents = extract_sentences(first["content"])[:3]
+            s = s.strip()
+            if len(s) < 25: continue
+            stok = set(tokenize(s))
+            overlap = len(q_tok & stok)
+            if overlap > 0:
+                all_sents.append((overlap, s, chunk["section"], chunk["url"]))
+ 
+    all_sents.sort(key=lambda x: -x[0])
+ 
+    # Detect intent
+    is_price    = any(w in q for w in ["цен","стоим","сколько","price","cost","тариф","платн","бесплатн"])
+    is_contact  = any(w in q for w in ["контакт","связ","телефон","email","почт","адрес","contact"])
+    is_how      = any(w in q for w in ["как","how","каким","способ","метод"])
+    is_what     = any(w in q for w in ["что","чем","what","какой","какая","о чём","расскажи","опиши"])
+ 
+    if is_price:   intro = "По вопросу цен и стоимости:"
+    elif is_contact: intro = "Контактная информация:"
+    elif is_how:   intro = "Как это работает:"
+    elif is_what:  intro = "Вот что об этом известно:"
+    else:          intro = "По вашему вопросу:"
+ 
+    if not all_sents:
+        # Fallback: return first meaningful sentences from best chunk
+        best = chunks[0]["content"]
+        sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', best) if len(s.strip()) > 25][:3]
         if sents:
-            return "Вот что я нашёл на сайте:\n\n" + " ".join(sents)
-        return "На сайте есть информация по этой теме, но точного ответа найти не удалось. Попробуйте уточнить вопрос."
+            return intro + "\n\n" + "\n".join("• " + s for s in sents)
+        return "Информация по этой теме есть на сайте, но конкретного ответа найти не удалось. Попробуйте уточнить вопрос."
  
-    # Build coherent answer
-    seen = set()
-    unique_sents = []
-    for _, s, chunk in best:
-        if s not in seen:
+    # Pick unique best sentences
+    seen, result = set(), []
+    for _, s, sec, url in all_sents:
+        if s not in seen and len(result) < 4:
             seen.add(s)
-            unique_sents.append((s, chunk))
+            result.append(s)
  
-    # Intro phrase based on question type
-    if is_price:
-        intro = "По поводу цен и стоимости:"
-    elif is_how:
-        intro = "Вот как это работает:"
-    elif is_where:
-        intro = "По поводу местонахождения:"
-    elif is_who:
-        intro = "Вот что известно:"
-    elif is_contact:
-        intro = "Контактная информация:"
-    elif is_what:
-        intro = "Вот что об этом известно:"
-    else:
-        intro = "По вашему вопросу нашёл следующее:"
+    return intro + "\n\n" + "\n".join("• " + s for s in result)
  
-    answer_parts = [intro, ""]
-    for s, _ in unique_sents[:4]:
-        answer_parts.append("• " + s)
-    
-    # Add source hint
-    sources_used = list({c["section"] for _, c in unique_sents[:4] if c.get("section")})
-    if sources_used:
-        answer_parts.append(f"\n(Источник: раздел «{', '.join(sources_used[:2])}»)")
- 
-    return "\n".join(answer_parts)
- 
-# ── API MODELS ────────────────────────────────────────────────────────────────
 class ScanRequest(BaseModel):
     url: str
  
@@ -228,7 +172,6 @@ class ChatRequest(BaseModel):
     message: str
     history: list = []
  
-# ── ROUTES ────────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 def index():
     return FileResponse(os.path.join(BASE_DIR, "frontend/index.html"))
@@ -239,42 +182,39 @@ def scan_site(req: ScanRequest):
     if not url.startswith("http"): url = "https://" + url
     site_id = make_site_id(url)
     with get_db() as db:
-        existing = db.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
-        if existing:
-            pages = db.execute("SELECT section, title, url FROM pages WHERE site_id=?", (site_id,)).fetchall()
+        ex = db.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
+        if ex:
+            pages = db.execute("SELECT section,title,url FROM pages WHERE site_id=?", (site_id,)).fetchall()
             sections = list({p["section"] for p in pages if p["section"]})
-            return {"site_id": site_id, "title": existing["title"], "url": url,
-                    "page_count": existing["page_count"], "sections": sections, "cached": True}
-    pages = crawl_site(url)
-    if not pages: raise HTTPException(400, "Не удалось просканировать сайт.")
-    site_title = pages[0]["title"] if pages else get_domain(url)
+            return {"site_id":site_id,"title":ex["title"],"url":url,"page_count":ex["page_count"],"sections":sections,"cached":True}
+    pages = crawl(url)
+    if not pages: raise HTTPException(400, "Не удалось просканировать сайт. Проверьте URL.")
+    title = pages[0]["title"]
     with get_db() as db:
-        db.execute("INSERT OR REPLACE INTO sites VALUES (?,?,?,?,?)",
-                   (site_id, url, site_title, datetime.now().isoformat(), len(pages)))
+        db.execute("INSERT OR REPLACE INTO sites VALUES (?,?,?,?,?)", (site_id,url,title,datetime.now().isoformat(),len(pages)))
         for p in pages:
             db.execute("INSERT INTO pages (site_id,url,title,content,section) VALUES (?,?,?,?,?)",
-                       (site_id, p["url"], p["title"], p["content"], p["section"]))
+                       (site_id,p["url"],p["title"],p["content"],p["section"]))
         db.commit()
     sections = list({p["section"] for p in pages if p["section"]})
-    return {"site_id": site_id, "title": site_title, "url": url,
-            "page_count": len(pages), "sections": sections, "cached": False}
+    return {"site_id":site_id,"title":title,"url":url,"page_count":len(pages),"sections":sections,"cached":False}
  
 @app.post("/api/chat")
 def chat(req: ChatRequest):
     with get_db() as db:
         site = db.execute("SELECT * FROM sites WHERE id=?", (req.site_id,)).fetchone()
     if not site: raise HTTPException(404, "Сайт не найден.")
-    chunks = tfidf_search(req.site_id, req.message)
-    answer = generate_answer(req.message, chunks, req.history)
+    chunks = search(req.site_id, req.message)
+    ans = answer(req.message, chunks, req.history)
     with get_db() as db:
         now = datetime.now().isoformat()
         db.execute("INSERT INTO messages (site_id,session_id,role,content,created_at) VALUES (?,?,?,?,?)",
-                   (req.site_id, req.session_id, "user", req.message, now))
+                   (req.site_id,req.session_id,"user",req.message,now))
         db.execute("INSERT INTO messages (site_id,session_id,role,content,created_at) VALUES (?,?,?,?,?)",
-                   (req.site_id, req.session_id, "assistant", answer, now))
+                   (req.site_id,req.session_id,"assistant",ans,now))
         db.commit()
-    sources = [{"title": c["title"], "url": c["url"]} for c in chunks]
-    return {"answer": answer, "sources": sources}
+    sources = [{"title":c["title"],"url":c["url"]} for c in chunks]
+    return {"answer":ans,"sources":sources}
  
 @app.get("/api/sites")
 def list_sites():
@@ -289,19 +229,19 @@ def delete_site(site_id: str):
         db.execute("DELETE FROM messages WHERE site_id=?", (site_id,))
         db.execute("DELETE FROM sites WHERE id=?", (site_id,))
         db.commit()
-    return {"ok": True}
+    return {"ok":True}
  
 @app.get("/api/stats/{site_id}")
 def site_stats(site_id: str):
     with get_db() as db:
         site = db.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
         pages = db.execute("SELECT section,title,url FROM pages WHERE site_id=?", (site_id,)).fetchall()
-        msg_count = db.execute("SELECT COUNT(*) as c FROM messages WHERE site_id=? AND role='user'", (site_id,)).fetchone()["c"]
+        cnt = db.execute("SELECT COUNT(*) as c FROM messages WHERE site_id=? AND role='user'", (site_id,)).fetchone()["c"]
     if not site: raise HTTPException(404)
-    sections = {}
+    secs = {}
     for p in pages:
         s = p["section"] or "Other"
-        sections[s] = sections.get(s, 0) + 1
-    return {"title": site["title"], "url": site["url"], "page_count": site["page_count"],
-            "question_count": msg_count, "scanned_at": site["scanned_at"],
-            "sections": sections, "pages": [dict(p) for p in pages]}
+        secs[s] = secs.get(s,0)+1
+    return {"title":site["title"],"url":site["url"],"page_count":site["page_count"],
+            "question_count":cnt,"scanned_at":site["scanned_at"],"sections":secs,"pages":[dict(p) for p in pages]}
+ 
